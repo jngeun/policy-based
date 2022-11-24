@@ -21,7 +21,7 @@ class LearningPlotter():
 
 
 if __name__ == "__main__":
-    file_path = "/home/user/policy-based/results/Pendulum/REINFORCE/scores.npy"
+    file_path = "/home/user/policy-based/results/CartPole/REINFORCE/scores.npy"
 
     learning_plotter = LearningPlotter()
     learning_plotter.plot(file_path)

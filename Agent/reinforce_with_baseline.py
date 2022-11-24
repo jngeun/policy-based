@@ -56,7 +56,7 @@ class StateValue(nn.Module):
 
 		self.fc1 = nn.Linear(state_dim, 512)
 		self.fc2 = nn.Linear(512, 1)
-		
+
 		self.optimizer = optim.Adam(self.parameters(), lr=lr)
 
 	
@@ -69,11 +69,14 @@ class StateValue(nn.Module):
 class ReinforceWithBaseline():
 	def __init__(self, state_dim, action_dim, max_action=None, lr=0.0001, gamma=0.99, continuous=False):
 		self.policy = Policy(state_dim ,action_dim, lr, continuous).to(device)
+		self.value = StateValue(state_dim, lr).to(device)
 		self.data = []
 		self.continuous = continuous
 		self.max_action = max_action
 
+
 	def select_action(self, state):
+		state = torch.FloatTensor(state).to(device)
 		if self.continuous:
 			mu, std = self.policy(state)
 			dist = Normal(mu, std)
@@ -85,7 +88,7 @@ class ReinforceWithBaseline():
 			prob = self.policy(state)
 			m = Categorical(prob)
 			a = m.sample()
-			return a, prob[a]
+			return a, torch.log(prob[a])
 
 
 	def save_data(self, data):
@@ -94,6 +97,7 @@ class ReinforceWithBaseline():
 	def train(self):
 		G = 0
 		self.policy.optimizer.zero_grad()
+		self.value.optimizer.zero_grad()
 		for r, log_prob in self.data[::-1]:
 			G = r + gamma * G
 			loss = -log_prob * G
@@ -125,9 +129,9 @@ def pendulum():
 		truncated = False
 	
 		while not done and not truncated:
-			action, prob = agent.select_action(torch.from_numpy(state).float().to(device))
+			action, log_prob = agent.select_action(state)
 			next_state, reward, done, truncated, info = env.step(action.detach().cpu().numpy())
-			agent.save_data((reward, prob))
+			agent.save_data((state, reward, log_prob))
 			state = next_state
 			score += reward
 
@@ -156,7 +160,7 @@ def cartpole():
 	print(f"observation space : {env.observation_space}")
 	print(f'action space: {env.action_space}')
 
-	agent = REINFORCE(env.observation_space.shape[0], 2,\
+	agent = ReinforceWithBaseline(env.observation_space.shape[0], 2,\
 						lr=lr, gamma=gamma, continuous=False)
 
 	score = 0.
@@ -168,7 +172,7 @@ def cartpole():
 		truncated = False
 	
 		while not done and not truncated:
-			action, prob = agent.select_action(torch.from_numpy(state).float().to(device))
+			action, prob = agent.select_action(state)
 			next_state, reward, done, truncated, info = env.step(action.detach().cpu().numpy())
 			agent.save_data((reward, prob))
 			state = next_state

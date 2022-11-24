@@ -15,7 +15,7 @@ lr = 0.0002
 gamma = 0.98
 
 # train
-env = "Pendulum"
+env = "CartPole"
 policy = "REINFORCE"
 result_path = f"./results/{env}/{policy}"
 model_path = f"./models/{env}/{policy}"
@@ -69,7 +69,7 @@ class REINFORCE():
 			prob = self.policy(state)
 			m = Categorical(prob)
 			a = m.sample()
-			return a, prob[a]
+			return a, torch.log(prob[a])
 
 
 	def save_data(self, data):
@@ -109,9 +109,9 @@ def pendulum():
 		truncated = False
 	
 		while not done and not truncated:
-			action, prob = agent.select_action(torch.from_numpy(state).float().to(device))
+			action, log_prob = agent.select_action(torch.from_numpy(state).float().to(device))
 			next_state, reward, done, truncated, info = env.step(action.detach().cpu().numpy())
-			agent.save_data((reward, prob))
+			agent.save_data((reward, log_prob))
 			state = next_state
 			score += reward
 
@@ -170,4 +170,4 @@ def cartpole():
 	env.close()
 
 if __name__ == "__main__":
-	pendulum()
+	cartpole()
