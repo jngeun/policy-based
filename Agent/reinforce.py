@@ -7,12 +7,21 @@ from torch.distributions import Normal, Categorical
 import os
 import numpy as np
 import gym
+from gym.wrappers.monitoring.video_recorder import VideoRecorder
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Hyperparameters
-lr = 0.0002
-gamma = 0.98
+lr = 1e-2
+gamma = 0.99
+batch_size = 256
+taru = 0.01
+actor_lr = 0.0005
+critic_lr = 0.001
+alpha_lr = 0.001
+init_alpha = 0.01
+target_entropy = -1.0
+update_num = 100
 
 # train
 env = "CartPole"
@@ -20,22 +29,20 @@ policy = "REINFORCE"
 result_path = f"./results/{env}/{policy}"
 model_path = f"./models/{env}/{policy}"
 print_interval = 20
-max_episode = int(1e5)
+max_episode = int(5e2)
 
 
 class Policy(nn.Module):
-	def __init__(self, state_dim, action_dim, lr, continuous=False):
+	def __init__(self, state_dim, action_dim, hidden_dim, continuous=False):
 		super(Policy, self).__init__()
 		self.continuous = continuous
-
-		self.fc1 = nn.Linear(state_dim, 512)
+		hidden_dim = int(hidden_dim)
+		self.fc1 = nn.Linear(state_dim, hidden_dim)
 		if self.continuous:
-			self.fc_mu = nn.Linear(512, action_dim)
-			self.fc_std = nn.Linear(512, action_dim)
+			self.fc_mu = nn.Linear(hidden_dim, action_dim)
+			self.fc_std = nn.Linear(hidden_dim, action_dim)
 		else:
-			self.fc2 = nn.Linear(512, action_dim)
-		
-		self.optimizer = optim.Adam(self.parameters(), lr=lr)
+			self.fc2 = nn.Linear(hidden_dim, action_dim)
 
 	
 	def forward(self, x):
@@ -51,39 +58,43 @@ class Policy(nn.Module):
 
 
 class REINFORCE():
-	def __init__(self, state_dim, action_dim, max_action=None, lr=0.0001, gamma=0.99, continuous=False):
-		self.policy = Policy(state_dim ,action_dim, lr, continuous).to(device)
-		self.data = []
-		self.continuous = continuous
+	def __init__(self, state_dim, action_dim, max_action=None, lr=1e-4, gamma=0.99, continuous=False):
+		self.policy = Policy(state_dim ,action_dim, hidden_dim=32, continuous=continuous).to(device)
+		self.trajectory = []
 		self.max_action = max_action
+		self.gamma = gamma
+		self.continuous = continuous
+
+		self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
 
 	def select_action(self, state):
+		state = torch.from_numpy(state).float().to(device)
 		if self.continuous:
 			mu, std = self.policy(state)
 			dist = Normal(mu, std)
 			action = dist.rsample()
 			log_prob = dist.log_prob(action)
-			return torch.tanh(action)* self.max_action, log_prob
+			return torch.tanh(action).detach().cpu().numpy() * self.max_action, log_prob
 		
 		else:
 			prob = self.policy(state)
 			m = Categorical(prob)
-			a = m.sample()
-			return a, torch.log(prob[a])
+			action = m.sample()
+			return action.detach().cpu().numpy(), m.log_prob(action)
 
 
-	def save_data(self, data):
-		self.data.append(data)
+	def add_data(self, trajectory):
+		self.trajectory.append(trajectory)
 
 	def train(self):
 		G = 0
-		self.policy.optimizer.zero_grad()
-		for r, log_prob in self.data[::-1]:
-			G = r + gamma * G
+		self.optimizer.zero_grad()
+		for r, log_prob in self.trajectory[::-1]:
+			G = r + self.gamma * G
 			loss = -log_prob * G
 			loss.backward()
-		self.policy.optimizer.step()
-		self.data = []
+		self.optimizer.step()
+		self.trajectory = []
 
 
 def pendulum():
@@ -101,33 +112,32 @@ def pendulum():
 						lr=lr, gamma=gamma, continuous=True)
 
 	score = 0.
-	episode_scores = []
+	episode_scores = np.empty((0,))
 
-	for n_episode in range(max_episode):
+	for n_episode in range(1, max_episode+1):
 		state, _ = env.reset()
 		done = False
 		truncated = False
 	
 		while not done and not truncated:
-			action, log_prob = agent.select_action(torch.from_numpy(state).float().to(device))
-			next_state, reward, done, truncated, info = env.step(action.detach().cpu().numpy())
-			agent.save_data((reward, log_prob))
+			action, log_prob = agent.select_action(state)
+			next_state, reward, done, truncated, info = env.step(action)
+			agent.add_data((reward, log_prob))
 			state = next_state
 			score += reward
 
-		episode_scores.append(score)
+		episode_scores = np.append(episode_scores, np.array([score]), axis=0)
 		score = 0.
 		agent.train()
 
 		if n_episode % print_interval == 0:
-			print("# of episode :{}, avg score : {}".format(n_episode, episode_scores[-1]))
+			print("# of episode :{}, avg score : {}".format(n_episode, episode_scores[-print_interval:].mean()))
 			np.save(f"{result_path}/scores", episode_scores)
 
 	env.close()
 
 
 def cartpole():
-
 	if not os.path.exists(result_path):
 		os.makedirs(result_path)
 
@@ -137,6 +147,7 @@ def cartpole():
 	# observation : (4,)
 	# action : discrete(2)
 	env = gym.make("CartPole-v1", render_mode="rgb_array")
+	# recorder = VideoRecorder(env=env, path=os.path.join(result_path, "video.mp4"))
 	print(f"observation space : {env.observation_space}")
 	print(f'action space: {env.action_space}')
 
@@ -144,29 +155,31 @@ def cartpole():
 						lr=lr, gamma=gamma, continuous=False)
 
 	score = 0.
-	episode_scores = []
+	episode_scores = np.empty((0,))
 
-	for n_episode in range(max_episode):
+	for n_episode in range(1, max_episode+1):
 		state, _ = env.reset()
 		done = False
 		truncated = False
 	
 		while not done and not truncated:
-			action, prob = agent.select_action(torch.from_numpy(state).float().to(device))
-			next_state, reward, done, truncated, info = env.step(action.detach().cpu().numpy())
-			agent.save_data((reward, prob))
+			action, prob = agent.select_action(state)
+			next_state, reward, done, truncated, info = env.step(action)
+			# recorder.capture_frame()
+			agent.add_data((reward, prob))
 			state = next_state
 			score += reward
 
-		episode_scores.append(score)
+		episode_scores = np.append(episode_scores, np.array([score]), axis=0)
 		score = 0.0
 		agent.train()
 		
 
 		if n_episode % print_interval == 0:
-			print("# of episode :{}, avg score : {}".format(n_episode, episode_scores[-1]))
+			print("# of episode :{}, avg score : {}".format(n_episode, episode_scores[-print_interval:].mean()))
 			np.save(f"{result_path}/scores", episode_scores)
-			
+
+	# recorder.close()
 	env.close()
 
 if __name__ == "__main__":

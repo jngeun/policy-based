@@ -6,15 +6,10 @@ from torch.distributions import Normal
 
 import gym
 import numpy as np
-import cv2
 import copy
 import os
-from pathlib import Path
 
-from ..Agent.utils import conv2d_size_out
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"device : {device}")
+from .utils import ReplayBuffer
 
 # Hyperparameters
 batch_size = 256
@@ -28,66 +23,19 @@ target_entropy = -1.0
 update_num = 100
 
 # train
-env = "CarRacing"
+env = "Pendulum"
 policy = "SAC"
 result_path = f"./results/{env}/{policy}"
 model_path = f"./models/{env}/{policy}"
-print_interval = 1
+print_interval = 20
 max_episode = int(5e2)
-
-
-class ReplayBuffer(object):
-	def __init__(self, state_dim, action_dim, max_size=int(1e5)):
-		self.max_size = max_size
-		self.ptr = 0
-		self.size = 0
-
-		self.state = np.zeros((max_size, state_dim[2], state_dim[0], state_dim[1]))
-		self.action = np.zeros((max_size, action_dim))
-		self.next_state = np.zeros((max_size, state_dim[2], state_dim[0], state_dim[1]))
-		self.reward = np.zeros((max_size, 1))
-		self.not_done = np.zeros((max_size, 1))
-
-		self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-	def add(self, state, action, next_state, reward, done):
-		self.state[self.ptr] = state
-		self.action[self.ptr] = action
-		self.next_state[self.ptr] = next_state
-		self.reward[self.ptr] = reward
-		self.not_done[self.ptr] = 1. - done
-
-		self.ptr = (self.ptr + 1) % self.max_size
-		self.size = min(self.size + 1, self.max_size)
-
-
-	def sample(self, batch_size):
-		ind = np.random.randint(0, self.size, size=batch_size)
-
-		return (
-			torch.FloatTensor(self.state[ind]).to(self.device),
-			torch.FloatTensor(self.action[ind]).to(self.device),
-			torch.FloatTensor(self.next_state[ind]).to(self.device),
-			torch.FloatTensor(self.reward[ind]).to(self.device),
-			torch.FloatTensor(self.not_done[ind]).to(self.device)
-		)
 
 
 class PolicyNet(nn.Module):
 	def __init__(self, state_dim, action_dim, hidden_dim, lr_pi, lr_alpha, init_alpha, target_entropy):
 		super(PolicyNet, self).__init__()
-
-		self.conv1 = nn.Conv2d(in_channels=state_dim[-1], out_channels=16, kernel_size=5, stride=4)
-		self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=2)
-		self.dropout = nn.Dropout(0.2)
-
-		convw = conv2d_size_out(state_dim[0], kernel_size=5, stride=4)
-		convw = conv2d_size_out(convw, kernel_size=3, stride=2)
-
-		self.linear_input_size = 3872
-
-		self.fc1 = nn.Linear(self.linear_input_size, hidden_dim)
+		self.hidden_dim = hidden_dim
+		self.fc1 = nn.Linear(state_dim, hidden_dim)
 		self.fc2 = nn.Linear(hidden_dim, hidden_dim)
 		self.fc3 = nn.Linear(hidden_dim, hidden_dim)
 
@@ -100,17 +48,7 @@ class PolicyNet(nn.Module):
 		self.log_alpha_optimizer = optim.Adam([self.log_alpha], lr=lr_alpha)
 		self.target_entropy = -action_dim
 
-
 	def forward(self, x):
-		if len(x.shape) == 3:
-			x = torch.unsqueeze(x, 0)
-		# x = torch.transpose(x, 0, 2)
-		x = F.relu(self.conv1(x))
-		x = self.dropout(x)
-		x = F.relu(self.conv2(x))
-		x = self.dropout(x)
-		x = x.reshape(-1, self.linear_input_size)
-
 		x = F.relu(self.fc1(x))
 		x = F.relu(self.fc2(x))
 		x = F.relu(self.fc3(x))
@@ -124,7 +62,6 @@ class PolicyNet(nn.Module):
 		real_log_prob = log_prob - torch.log(1-torch.tanh(action).pow(2) + 1e-7)
 		return real_action, real_log_prob
 
-	
 	def train_net(self, q1, q2, mini_batch):
 		s, _, _, _, _ = mini_batch
 		a, log_prob = self.forward(s)
@@ -149,41 +86,23 @@ class QNet(nn.Module):
 	def __init__(self, state_dim, action_dim, hidden_dim, learning_rate, tau):
 		super(QNet, self).__init__()
 
-		self.conv1 = nn.Conv2d(in_channels=state_dim[-1], out_channels=16, kernel_size=5, stride=4)
-		self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=2)
-		self.dropout = nn.Dropout(0.2)
+		self.action_dim = action_dim
+		self.hidden_dim = hidden_dim
 
-		convw = conv2d_size_out(state_dim[0], kernel_size=5, stride=4)
-		convw = conv2d_size_out(convw, kernel_size=3, stride=2)
-
-		self.linear_input_size = 3872
-
-		self.fc1 = nn.Linear(self.linear_input_size, hidden_dim)
-		self.fc2 = nn.Linear(hidden_dim+action_dim, hidden_dim)
+		self.fc1 = nn.Linear(state_dim+action_dim, hidden_dim)
+		self.fc2 = nn.Linear(hidden_dim, hidden_dim)
 		self.fc3 = nn.Linear(hidden_dim, hidden_dim)
 		self.fc4 = nn.Linear(hidden_dim, 1)
-
 		self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
 		self.tau = tau
 
-
 	def forward(self, x, a):
-		# x = torch.transpose(x, 0, 2)
-		if len(x.shape) == 3:
-			x = torch.unsqueeze(x, 0)
-		x = F.relu(self.conv1(x))
-		x = self.dropout(x)
-		x = F.relu(self.conv2(x))
-		x = self.dropout(x)
-		x = x.reshape(-1, self.linear_input_size)
-		
-		embedding = F.relu(self.fc1(x))
-		cat = torch.cat([embedding, a], dim=1)
-		q = F.relu(self.fc2(cat))
+		cat = torch.cat([x,a], dim=1)
+		q = F.relu(self.fc1(cat))
+		q = F.relu(self.fc2(q))
 		q = F.relu(self.fc3(q))
 		q = self.fc4(q)
 		return q
-
 
 	def train_net(self, target, mini_batch):
 		s, a, r, s_prime, done = mini_batch
@@ -269,113 +188,75 @@ class SAC():
 
 		return target
 
-
-
-class CarRacing():
-	def __init__(self):
-		# observation : (96, 96, 3)
-		# action : (3, )
-		self.env = gym.make("CarRacing-v2", domain_randomize=True, continuous=True, render_mode="rgb_array")
-		self.figure_dir = Path("/home/user/policy-based/figure")
-		self.observation_space = np.asarray([96, 96, 1])
-		self.action_space = int(3)
-
-
-	def step(self, action):
-		next_state, reward, done, _, info = self.env.step(action)
-		next_state = self.image_processing(next_state)
-		return next_state, reward, done, _, info
-
-
-	def reset(self):
-		state, _ = self.env.reset()
-		state = self.image_processing(state)
-		return state, _
-
-
-	def image_processing(self, obs):
-		obs = self.green_mask(obs)
-		obs = self.gray_scale(obs)
-		obs = self.blur_image(obs)
-		obs = self.canny_edge_detector(obs)
-		# obs = self.fine_middle_position(obs)
-
-		return np.expand_dims(obs, 0)
-
-
-	def green_mask(self, observation):
+	
+	def save(self, filename):
+		torch.save(self.q1.state_dict(), filename + "_q1")
+		torch.save(self.q1.optimizer.state_dict(), filename + "_q1_optimizer")
+		torch.save(self.q2.state_dict(), filename + "_q2")
+		torch.save(self.q2.optimizer.state_dict(), filename + "_q2_optimizer")
 		
-		#convert to hsv
-		hsv = cv2.cvtColor(observation, cv2.COLOR_BGR2HSV)
-		
-		mask_green = cv2.inRange(hsv, (36, 25, 25), (70, 255,255))
-
-		#slice the green
-		imask_green = mask_green>0
-		green = np.zeros_like(observation, np.uint8)
-		green[imask_green] = observation[imask_green]
-		return(green)
+		torch.save(self.pi.state_dict(), filename + "_actor")
+		torch.save(self.pi.optimizer.state_dict(), filename + "_actor_optimizer")
+		torch.save(self.pi.log_alpha, filename + "_log_alpha")
+		torch.save(self.pi.log_alpha_optimizer.state_dict(), filename + "_log_alpha_optimizer")
 
 	
-	def gray_scale(self, observation):
-		gray = cv2.cvtColor(observation, cv2.COLOR_RGB2GRAY)
-		return gray
+	def load(self, filename):
+		self.q1.load_state_dict(torch.load(filename + "_q1"))
+		self.q1.optimizer.load_state_dict(torch.load(filename + "_q1_optimizer"))
+		self.q2.load_state_dict(torch.load(filename + "_q2"))
+		self.q2.optimizer.load_state_dict(torch.load(filename + "_q2_optimizer"))
+		self.q1_target = copy.deepcopy(self.q1)
+		self.q2_target = copy.deepcopy(self.q2)
+
+		self.pi.load_state_dict(torch.load(filename + "_actor"))
+		self.pi.optimizer.load_state_dict(torch.load(filename + "_actor_optimizer"))
+		self.actor_target = copy.deepcopy(self.pi)
+		self.pi.log_alpha = torch.load(filename + "_log_alpha")
+		self.pi.log_alpha_optimizer.load_state_dict(torch.load(filename + "_log_alpha_optimizer"))
+
+		print(f"Load {filename} Done!")
 
 
-	def blur_image(self, observation):
-		blur = cv2.GaussianBlur(observation, (5, 5), 0)
-		return blur
-
-
-	def canny_edge_detector(self, observation):
-		canny = cv2.Canny(observation, 50, 150)
-		return canny
-	
-
-	def fine_middle_position(self, observation):
-		cropped = observation[63:65, 24:73]
-		nz = cv2.findNonZero(cropped)
-		middle = (nz[:,0,0].max() + nz[:,0,0].min())/2
-
-		return middle
-
-
-def main():
+def pendulum():
 	if not os.path.exists(result_path):
 		os.makedirs(result_path)
 
 	if os.path.exists(model_path):
 		os.makedirs(model_path)
-	# observation : (96, 96, 3)
-	# action : (3, )
-	env = CarRacing()
+
+	# observation : (3,)
+	# action : (1, ) 
+	# action_bound : [-2, 2]
+	env = gym.make("Pendulum-v1", render_mode="rgb_array")
 
 	kwargs = {
-	"state_dim": env.observation_space,
-	"action_dim": env.action_space,
-	"max_action": 2,
-	"batch_size": batch_size,
-	"discount": discount,
-	"lr_pi": lr_pi,
-	"lr_q": lr_q,
-	"lr_alpha": lr_alpha,
-	"init_alpha": init_alpha,
-	"target_entropy": target_entropy,
-	"update_num": update_num
-	}
+		"state_dim": env.observation_space.shape[0],
+		"action_dim": env.action_space.shape[0],
+		"max_action": 2,
+		"batch_size": batch_size,
+		"discount": discount,
+		"lr_pi": lr_pi,
+		"lr_q": lr_q,
+		"lr_alpha": lr_alpha,
+		"init_alpha": init_alpha,
+		"target_entropy": target_entropy,
+		"update_num": update_num
+		}
+
 	agent = SAC(**kwargs)
 
 	score = 0.
 	episode_scores = np.empty((0,))
-	
-	for n_episode in range(max_episode):
+
+	for n_episode in range(1, max_episode+1):
 		state, _ = env.reset()
 		done = False
 		truncated = False
 	
 		while not done and not truncated:
 			action, log_prob = agent.select_action(state)
-			next_state, reward, done, truncated, info = env.step(action[0])
+			next_state, reward, done, truncated, info = env.step(action)
 			agent.replay_buffer.add(state, action, next_state, reward, done)
 			state = next_state
 			score += reward
@@ -390,5 +271,6 @@ def main():
 
 	env.close()
 
+
 if __name__ == "__main__":
-	main()
+    pendulum()
