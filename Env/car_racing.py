@@ -293,25 +293,30 @@ class CarRacing():
 		return state, _
 
 
+	def close(self):
+		self.env.close()
+
+
 	def image_processing(self, obs):
 		obs = self.green_mask(obs)
 		obs = self.gray_scale(obs)
 		obs = self.blur_image(obs)
+		cv2.imshow("obs", obs)
+		cv2.waitKey(1)
 		obs = self.canny_edge_detector(obs)
-		# obs = self.fine_middle_position(obs)
+		# print(self.fine_middle_position(obs))
 
 		return np.expand_dims(obs, 0)
 
 
 	def green_mask(self, observation):
-		
 		#convert to hsv
 		hsv = cv2.cvtColor(observation, cv2.COLOR_BGR2HSV)
 		
 		mask_green = cv2.inRange(hsv, (36, 25, 25), (70, 255,255))
 
 		#slice the green
-		imask_green = mask_green>0
+		imask_green = mask_green > 0
 		green = np.zeros_like(observation, np.uint8)
 		green[imask_green] = observation[imask_green]
 		return(green)
@@ -335,7 +340,10 @@ class CarRacing():
 	def fine_middle_position(self, observation):
 		cropped = observation[63:65, 24:73]
 		nz = cv2.findNonZero(cropped)
-		middle = (nz[:,0,0].max() + nz[:,0,0].min())/2
+		try:
+			middle = (nz[:,0,0].max() + nz[:,0,0].min())/2
+		except:
+			middle = 0
 
 		return middle
 
