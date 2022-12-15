@@ -42,9 +42,9 @@ class ReplayBuffer(object):
 		self.ptr = 0
 		self.size = 0
 
-		self.state = np.zeros((max_size, state_dim[2], state_dim[0], state_dim[1]))
+		self.state = np.zeros((max_size, state_dim))
 		self.action = np.zeros((max_size, action_dim))
-		self.next_state = np.zeros((max_size, state_dim[2], state_dim[0], state_dim[1]))
+		self.next_state = np.zeros((max_size, state_dim))
 		self.reward = np.zeros((max_size, 1))
 		self.not_done = np.zeros((max_size, 1))
 
@@ -75,19 +75,10 @@ class ReplayBuffer(object):
 
 
 class PolicyNet(nn.Module):
-	def __init__(self, state_dim, action_dim, hidden_dim, lr_pi, lr_alpha, init_alpha, target_entropy):
+	def __init__(self, state_dim, action_dim, hidden_dim, lr_pi, lr_alpha, init_alpha):
 		super(PolicyNet, self).__init__()
 
-		self.conv1 = nn.Conv2d(in_channels=state_dim[-1], out_channels=16, kernel_size=5, stride=4)
-		self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=2)
-		self.dropout = nn.Dropout(0.2)
-
-		convw = conv2d_size_out(state_dim[0], kernel_size=5, stride=4)
-		convw = conv2d_size_out(convw, kernel_size=3, stride=2)
-
-		self.linear_input_size = 3872
-
-		self.fc1 = nn.Linear(self.linear_input_size, hidden_dim)
+		self.fc1 = nn.Linear(state_dim, hidden_dim)
 		self.fc2 = nn.Linear(hidden_dim, hidden_dim)
 		self.fc3 = nn.Linear(hidden_dim, hidden_dim)
 
@@ -102,15 +93,6 @@ class PolicyNet(nn.Module):
 
 
 	def forward(self, x):
-		if len(x.shape) == 3:
-			x = torch.unsqueeze(x, 0)
-		# x = torch.transpose(x, 0, 2)
-		x = F.relu(self.conv1(x))
-		x = self.dropout(x)
-		x = F.relu(self.conv2(x))
-		x = self.dropout(x)
-		x = x.reshape(-1, self.linear_input_size)
-
 		x = F.relu(self.fc1(x))
 		x = F.relu(self.fc2(x))
 		x = F.relu(self.fc3(x))
@@ -118,6 +100,7 @@ class PolicyNet(nn.Module):
 		mu = self.fc_mu(x)
 		std = F.softplus(self.fc_std(x))
 		dist = Normal(mu, std)
+
 		action = dist.rsample()
 		log_prob = dist.log_prob(action)
 		real_action = torch.tanh(action)
@@ -148,40 +131,19 @@ class PolicyNet(nn.Module):
 class QNet(nn.Module):
 	def __init__(self, state_dim, action_dim, hidden_dim, learning_rate, tau):
 		super(QNet, self).__init__()
-
-		self.conv1 = nn.Conv2d(in_channels=state_dim[-1], out_channels=16, kernel_size=5, stride=4)
-		self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=2)
-		self.dropout = nn.Dropout(0.2)
-
-		convw = conv2d_size_out(state_dim[0], kernel_size=5, stride=4)
-		convw = conv2d_size_out(convw, kernel_size=3, stride=2)
-
-		self.linear_input_size = 3872
-
-		self.fc1 = nn.Linear(self.linear_input_size, hidden_dim)
-		self.fc2 = nn.Linear(hidden_dim+action_dim, hidden_dim)
-		self.fc3 = nn.Linear(hidden_dim, hidden_dim)
-		self.fc4 = nn.Linear(hidden_dim, 1)
+		self.fc1 = nn.Linear(state_dim+action_dim, hidden_dim)
+		self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+		self.fc3 = nn.Linear(hidden_dim, 1)
 
 		self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
 		self.tau = tau
 
 
 	def forward(self, x, a):
-		# x = torch.transpose(x, 0, 2)
-		if len(x.shape) == 3:
-			x = torch.unsqueeze(x, 0)
-		x = F.relu(self.conv1(x))
-		x = self.dropout(x)
-		x = F.relu(self.conv2(x))
-		x = self.dropout(x)
-		x = x.reshape(-1, self.linear_input_size)
-		
-		embedding = F.relu(self.fc1(x))
-		cat = torch.cat([embedding, a], dim=1)
-		q = F.relu(self.fc2(cat))
-		q = F.relu(self.fc3(q))
-		q = self.fc4(q)
+		q = torch.cat([x, a], dim=1)
+		q = F.relu(self.fc1(q))
+		q = F.relu(self.fc2(q))
+		q = self.fc3(q)
 		return q
 
 
@@ -228,18 +190,17 @@ class SAC():
 		self.target_entropy = target_entropy
 		self.update_num = update_num
 
-		self.q1 = QNet(state_dim, action_dim, 32, lr_q, tau).to(self.device)
-		self.q2 = QNet(state_dim, action_dim, 32, lr_q, tau).to(self.device)
+		self.q1 = QNet(state_dim, action_dim, 128, lr_q, tau).to(self.device)
+		self.q2 = QNet(state_dim, action_dim, 128, lr_q, tau).to(self.device)
 		self.q1_target = copy.deepcopy(self.q1)
 		self.q2_target = copy.deepcopy(self.q2)
-		self.pi = PolicyNet(state_dim, action_dim, 32, lr_pi, lr_alpha, init_alpha, target_entropy).to(self.device)
+		self.pi = PolicyNet(state_dim, action_dim, 128, lr_pi, lr_alpha, init_alpha).to(self.device)
 
 		self.replay_buffer = ReplayBuffer(self.state_dim, self.action_dim)
 
 	def select_action(self, state):
 		state = torch.from_numpy(state).float().to(self.device)
 		a, log_prob= self.pi(state)
-
 		return a.detach().cpu().numpy() * self.max_action, log_prob
 
 
@@ -275,21 +236,44 @@ class CarRacing():
 	def __init__(self):
 		# observation : (96, 96, 3)
 		# action : (3, )
-		self.env = gym.make("CarRacing-v2", domain_randomize=True, continuous=True, render_mode="rgb_array")
+		self.env = gym.make("CarRacing-v2", domain_randomize=False, continuous=True, render_mode="rgb_array")
 		self.figure_dir = Path("/home/user/policy-based/figure")
-		self.observation_space = np.asarray([96, 96, 1])
-		self.action_space = int(3)
+		self.n_step = 0
 
+		self.init_frames = 100
+		self.agent_pos = (70, 50)
+		self.crop_h = (60, self.agent_pos[0])
+		self.crop_w = (30, 70)
+
+		self.observation_space = int(2 * (self.crop_h[1]-self.crop_h[0])) # (left_lane, right_lane)
+		self.action_space = int(1) # (linear, angular, brake)
+		print(f' State_dim :{self.observation_space}, Action_dim :{self.action_space}')
+
+		# Reward Gain
+		self.middle_gain = 2
+		self.speed_gain = 0.1
+		self.brake_gain = 0.1
+		
 
 	def step(self, action):
-		next_state, reward, done, _, info = self.env.step(action)
-		next_state = self.image_processing(next_state)
-		return next_state, reward, done, _, info
+		self.n_step += 1
+		next_state, _, done, truncated, info = self.env.step(np.array([action, 0.01, 0], dtype=np.float32))
+		next_state, truncated = self.image_processing(next_state)
+		reward = self.get_reward(next_state, action, truncated)
+		# Normalize
+		next_state = (next_state - self.crop_w[0]) / (self.crop_w[1]-self.crop_w[0])
+		return next_state, reward, done, truncated, info
 
 
 	def reset(self):
+		self.n_step= 0
 		state, _ = self.env.reset()
-		state = self.image_processing(state)
+
+		# pass init frames
+		for _ in range(self.init_frames): 
+			state, _, _, _, _ = self.env.step(np.zeros(3))
+
+		state, truncated = self.image_processing(state)
 		return state, _
 
 
@@ -297,22 +281,73 @@ class CarRacing():
 		self.env.close()
 
 
-	def image_processing(self, obs):
-		obs = self.green_mask(obs)
-		obs = self.gray_scale(obs)
-		obs = self.blur_image(obs)
-		cv2.imshow("obs", obs)
-		cv2.waitKey(1)
-		obs = self.canny_edge_detector(obs)
-		# print(self.fine_middle_position(obs))
+	def get_reward(self, state, action, truncated):
+		if truncated:
+			return -1
+		
+		# get high reward if agent is located in the middle of lane
+		middle = state.mean()
+		distance = 2 * abs(self.agent_pos[1] - middle) / (self.crop_w[1] - self.crop_w[0])
+		distance_reward = self.middle_gain * (-distance + 0.25)
+		# print(f'middle : {middle}, position : {self.agent_pos[1]}, distance : {distance}, reward : {distance_reward}')
 
-		return np.expand_dims(obs, 0)
+		# The faster agent go, the higher the reward
+		# speed_reward = self.speed_gain * action[1]
+		# print(f'gas : {action[1]}, reward : {speed_reward}')
+
+		# get penalty when brake is applied
+		# brake_penalty = -self.brake_gain * action[2]
+
+		print(f'distance_reward : {distance_reward}')
+		return distance_reward
+
+	def check_out_of_road(self, state):
+		# check whether car is located on the green field
+		is_green = state[self.agent_pos][1] > 150
+
+		return is_green
+
+
+	def image_processing(self, obs):
+		mask = self.green_mask(obs)
+		gray = self.gray_scale(mask)
+		blur = self.blur_image(gray)
+		edge = self.canny_edge_detector(blur)
+		lane = self.find_lane(edge)
+
+		cv2.imshow("mask", mask)
+		cv2.imshow("gray", gray)
+		cv2.imshow("blur", blur)
+		cv2.imshow("edge", edge)
+		cv2.waitKey(1)
+
+		# If car run out of lane, terminate episode
+		truncated = self.check_out_of_road(mask)
+
+		self.show_env(obs, lane)
+		return lane, truncated
+
+
+	def show_env(self, obs, lane):
+		# draw the range of image crop
+		cv2.rectangle(obs, (self.crop_w[0], self.crop_h[0]), (self.crop_w[1], self.crop_h[1]), (249, 146, 69), thickness=3)
+		
+		
+		for i, h in enumerate(range(self.crop_h[0], self.crop_h[1])):
+			# draw lane point
+			cv2.circle(obs, (lane[2*i], h), 3, (200, 30, 30))
+			cv2.circle(obs, (lane[2*i+1], h), 3, (200, 30, 30))
+			# draw middle point
+			cv2.circle(obs, (int((lane[2*i] + lane[2*i+1]) / 2), h), 3, (30, 30, 200))
+
+		obs = cv2.resize(obs,(600, 600))
+		cv2.imshow("Car Racing", obs)
+		cv2.waitKey(1)
 
 
 	def green_mask(self, observation):
 		#convert to hsv
 		hsv = cv2.cvtColor(observation, cv2.COLOR_BGR2HSV)
-		
 		mask_green = cv2.inRange(hsv, (36, 25, 25), (70, 255,255))
 
 		#slice the green
@@ -337,16 +372,30 @@ class CarRacing():
 		return canny
 	
 
-	def fine_middle_position(self, observation):
-		cropped = observation[63:65, 24:73]
-		nz = cv2.findNonZero(cropped)
-		try:
-			middle = (nz[:,0,0].max() + nz[:,0,0].min())/2
-		except:
-			middle = 0
+	def find_lane(self, observation):
+		lane_list = []
 
-		return middle
+		for h in range(self.crop_h[0], self.crop_h[1]):
+			cropped = observation[h, self.crop_w[0]:self.crop_w[1]]
+			nz = cv2.findNonZero(cropped)
+			if nz is None:
+				(left, right) = self.crop_w
+				lane_list.extend([left, right])
+				continue
+			left = nz[:,0,1].min() + self.crop_w[0]
+			right = nz[:,0,1].max() + self.crop_w[0]
+			if right - left < 5:
+				if self.agent_pos[1] < left and self.agent_pos[1] < right:
+					left = self.crop_w[0]
+				else:
+					right = self.crop_w[1]
 
+			lane_list.extend([left, right])
+		
+		obs = np.array(lane_list, dtype=np.int32)
+		
+		return obs
+	
 
 def main():
 	if not os.path.exists(result_path):
@@ -361,7 +410,7 @@ def main():
 	kwargs = {
 	"state_dim": env.observation_space,
 	"action_dim": env.action_space,
-	"max_action": 2,
+	"max_action": 1,
 	"batch_size": batch_size,
 	"discount": discount,
 	"lr_pi": lr_pi,
@@ -383,7 +432,7 @@ def main():
 	
 		while not done and not truncated:
 			action, log_prob = agent.select_action(state)
-			next_state, reward, done, truncated, info = env.step(action[0])
+			next_state, reward, done, truncated, info = env.step(action)
 			agent.replay_buffer.add(state, action, next_state, reward, done)
 			state = next_state
 			score += reward
