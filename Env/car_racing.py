@@ -10,8 +10,7 @@ import cv2
 import copy
 import os
 from pathlib import Path
-
-from ..Agent.utils import conv2d_size_out
+from collections import namedtuple
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"device : {device}")
@@ -107,7 +106,7 @@ class PolicyNet(nn.Module):
 		real_log_prob = log_prob - torch.log(1-torch.tanh(action).pow(2) + 1e-7)
 		return real_action, real_log_prob
 
-	
+
 	def train_net(self, q1, q2, mini_batch):
 		s, _, _, _, _ = mini_batch
 		a, log_prob = self.forward(s)
@@ -173,7 +172,9 @@ class SAC():
 		lr_alpha=0.001,
 		init_alpha=0.01,
 		target_entropy=-1.0,
-		update_num=20):
+		update_num=20,
+		train_start=3e3
+		):
 			
 		self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -189,6 +190,7 @@ class SAC():
 		self.init_alpha = init_alpha
 		self.target_entropy = target_entropy
 		self.update_num = update_num
+		self.train_start = train_start
 
 		self.q1 = QNet(state_dim, action_dim, 128, lr_q, tau).to(self.device)
 		self.q2 = QNet(state_dim, action_dim, 128, lr_q, tau).to(self.device)
@@ -205,6 +207,9 @@ class SAC():
 
 
 	def train(self, batch_size=256):
+		if self.replay_buffer.size < self.train_start:
+			return
+
 		for i in range(self.update_num):
 				# Sample replay buffer
 				mini_batch = self.replay_buffer.sample(batch_size)
@@ -240,29 +245,33 @@ class CarRacing():
 		self.figure_dir = Path("/home/user/policy-based/figure")
 		self.n_step = 0
 
-		self.init_frames = 100
-		self.agent_pos = (70, 50)
-		self.crop_h = (60, self.agent_pos[0])
-		self.crop_w = (30, 70)
+		self.init_frames = 100 # init frame represents game loading scene
+		Pos = namedtuple('Pos',['h', 'w'])
+		self.agent_center = Pos(h=72, w=48)
+		self.vertex = [(-6, -4), (-6, 4), (6, -4), (6, 4)]
 
-		self.observation_space = int(2 * (self.crop_h[1]-self.crop_h[0])) # (left_lane, right_lane)
+		self.crop_h = (self.agent_center.h-10, self.agent_center.h)
+		self.crop_w = (self.agent_center.w-20, self.agent_center.w+20)
+
+		self.observation_space = int(3 * (self.crop_h[1]-self.crop_h[0])) # (left_lane, right_lane)
 		self.action_space = int(1) # (linear, angular, brake)
 		print(f' State_dim :{self.observation_space}, Action_dim :{self.action_space}')
 
 		# Reward Gain
 		self.middle_gain = 2
+		self.smooth_gain = -0.2
 		self.speed_gain = 0.1
 		self.brake_gain = 0.1
+		self.time_gain = 0.3
 		
 
 	def step(self, action):
 		self.n_step += 1
-		next_state, _, done, truncated, info = self.env.step(np.array([action, 0.01, 0], dtype=np.float32))
+		next_state, _, done, truncated, info = self.env.step(np.array([action[0], 0.01, 0], dtype=np.float32))
 		next_state, truncated = self.image_processing(next_state)
 		reward = self.get_reward(next_state, action, truncated)
-		# Normalize
-		next_state = (next_state - self.crop_w[0]) / (self.crop_w[1]-self.crop_w[0])
-		return next_state, reward, done, truncated, info
+		
+		return self.normalize_state(next_state), reward, done, truncated, info
 
 
 	def reset(self):
@@ -274,7 +283,7 @@ class CarRacing():
 			state, _, _, _, _ = self.env.step(np.zeros(3))
 
 		state, truncated = self.image_processing(state)
-		return state, _
+		return self.normalize_state(state), _
 
 
 	def close(self):
@@ -286,10 +295,16 @@ class CarRacing():
 			return -1
 		
 		# get high reward if agent is located in the middle of lane
-		middle = state.mean()
-		distance = 2 * abs(self.agent_pos[1] - middle) / (self.crop_w[1] - self.crop_w[0])
-		distance_reward = self.middle_gain * (-distance + 0.25)
-		# print(f'middle : {middle}, position : {self.agent_pos[1]}, distance : {distance}, reward : {distance_reward}')
+		middle = (state[-1] + state[-2]) / 2
+		distance = 2 * abs(self.agent_center.w - middle) / (self.crop_w[1] - self.crop_w[0])
+		distance_reward = self.middle_gain * (-distance + 0.1)
+		# print(f'middle : {middle}, position : {self.agent_center.w}, distance : {distance}, reward : {distance_reward}')
+
+		# get high reward if agent drive car smoothly
+		smooth_reward = self.smooth_gain * abs(action[0])
+
+		# time reward
+		time_reward = self.time_gain
 
 		# The faster agent go, the higher the reward
 		# speed_reward = self.speed_gain * action[1]
@@ -298,12 +313,15 @@ class CarRacing():
 		# get penalty when brake is applied
 		# brake_penalty = -self.brake_gain * action[2]
 
-		print(f'distance_reward : {distance_reward}')
-		return distance_reward
+		return distance_reward+smooth_reward+time_reward
 
 	def check_out_of_road(self, state):
+		is_green = False
+		green_threshold = 150
+
 		# check whether car is located on the green field
-		is_green = state[self.agent_pos][1] > 150
+		for h, w in self.vertex:
+			is_green = is_green or state[h+self.agent_center.h][w+self.agent_center.w][1] > green_threshold
 
 		return is_green
 
@@ -315,11 +333,11 @@ class CarRacing():
 		edge = self.canny_edge_detector(blur)
 		lane = self.find_lane(edge)
 
-		cv2.imshow("mask", mask)
-		cv2.imshow("gray", gray)
-		cv2.imshow("blur", blur)
-		cv2.imshow("edge", edge)
-		cv2.waitKey(1)
+		# cv2.imshow("mask", mask)
+		# cv2.imshow("gray", gray)
+		# cv2.imshow("blur", blur)
+		# cv2.imshow("edge", edge)
+		# cv2.waitKey(1)
 
 		# If car run out of lane, terminate episode
 		truncated = self.check_out_of_road(mask)
@@ -329,20 +347,37 @@ class CarRacing():
 
 
 	def show_env(self, obs, lane):
+		# draw Circle to vectex positions of car
+		# for h, w in self.vertex:
+		# 	cv2.circle(obs, (w+self.agent_center.w, h+self.agent_center.h), 1, (0, 255, 0), -1)
+
 		# draw the range of image crop
-		cv2.rectangle(obs, (self.crop_w[0], self.crop_h[0]), (self.crop_w[1], self.crop_h[1]), (249, 146, 69), thickness=3)
+		cv2.rectangle(obs, (self.crop_w[0], self.crop_h[0]), (self.crop_w[1], self.crop_h[1]), (249, 146, 69), thickness=1)
 		
-		
-		for i, h in enumerate(range(self.crop_h[0], self.crop_h[1])):
+		for i in range(int(len(lane)/3)):
 			# draw lane point
-			cv2.circle(obs, (lane[2*i], h), 3, (200, 30, 30))
-			cv2.circle(obs, (lane[2*i+1], h), 3, (200, 30, 30))
+			cv2.circle(obs, (int(lane[3*i+1]), int(lane[3*i])), 1, (200, 30, 30))
+			cv2.circle(obs, (int(lane[3*i+2]), int(lane[3*i])), 1, (200, 30, 30))
 			# draw middle point
-			cv2.circle(obs, (int((lane[2*i] + lane[2*i+1]) / 2), h), 3, (30, 30, 200))
+			cv2.circle(obs, (int((lane[3*i+1] + lane[3*i+2]) / 2), int(lane[3*i])), 1, (30, 30, 200))
 
 		obs = cv2.resize(obs,(600, 600))
 		cv2.imshow("Car Racing", obs)
 		cv2.waitKey(1)
+
+
+	def normalize_state(self, state):
+		for i in range(len(state)):
+			if i % 3 == 0:
+				state[i] = self.normalize(state[i], self.crop_h[0], self.crop_h[1])
+			else:
+				state[i] = self.normalize(state[i], self.crop_w[0], self.crop_w[1])
+		return state
+
+	
+	def normalize(self, value, min, max):
+		assert min <= value and value <= max
+		return (float(value) - float(min)) / (float(max) - float(min))
 
 
 	def green_mask(self, observation):
@@ -376,23 +411,20 @@ class CarRacing():
 		lane_list = []
 
 		for h in range(self.crop_h[0], self.crop_h[1]):
-			cropped = observation[h, self.crop_w[0]:self.crop_w[1]]
-			nz = cv2.findNonZero(cropped)
-			if nz is None:
-				(left, right) = self.crop_w
-				lane_list.extend([left, right])
-				continue
-			left = nz[:,0,1].min() + self.crop_w[0]
-			right = nz[:,0,1].max() + self.crop_w[0]
-			if right - left < 5:
-				if self.agent_pos[1] < left and self.agent_pos[1] < right:
-					left = self.crop_w[0]
-				else:
-					right = self.crop_w[1]
+			cropped_left = observation[h, self.crop_w[0]:self.agent_center.w]
+			cropped_right = observation[h, self.agent_center.w:self.crop_w[1]]
 
-			lane_list.extend([left, right])
+			nz_left = np.array(np.nonzero(cropped_left)).reshape(-1,)
+			nz_right = np.array(np.nonzero(cropped_right)).reshape(-1,)
+
+			# Find left lane
+			left = -(cropped_left.shape[0] - nz_left[-1]) + self.agent_center.w if nz_left.shape[0] != 0 else self.crop_w[0]
+			# Find right lane
+			right = nz_right[0] + self.agent_center.w if nz_right.shape[0] != 0 else self.crop_w[1]
+
+			lane_list.extend([h, left, right])
 		
-		obs = np.array(lane_list, dtype=np.int32)
+		obs = np.array(lane_list, dtype=np.float32)
 		
 		return obs
 	
@@ -433,6 +465,7 @@ def main():
 		while not done and not truncated:
 			action, log_prob = agent.select_action(state)
 			next_state, reward, done, truncated, info = env.step(action)
+			# print(f'state:{state}, action:{action}, next_state:{next_state}, reward:{reward}, done:{done}')
 			agent.replay_buffer.add(state, action, next_state, reward, done)
 			state = next_state
 			score += reward
